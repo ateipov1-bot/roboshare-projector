@@ -16,9 +16,13 @@ dependencies:
   http: ^1.2.1
   path_provider: ^2.1.4
   shared_preferences: ^2.2.3
+  network_info_plus: ^6.0.0  # Get Wi-Fi network information
 
   # ✅ единственный PDF-пакет, поддерживающий новые SDK
   pdfx: ^2.6.0
+
+  # QR code generation
+  qr_flutter: ^4.1.0
 
 dev_dependencies:
   flutter_test:
