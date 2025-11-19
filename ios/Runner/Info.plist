@@ -45,5 +45,12 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>This app needs access to your local network to receive presentations from your phone.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_roboshare._tcp</string>
+		<string>_roboshare._udp</string>
+	</array>
 </dict>
 </plist>
