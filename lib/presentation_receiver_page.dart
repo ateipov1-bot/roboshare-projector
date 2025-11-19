@@ -1,10 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:pdfx/pdfx.dart';
+import 'services/http_server.dart';
+import 'pages/qr_waiting_page.dart';
 
 class PresentationReceiverPage extends StatefulWidget {
   const PresentationReceiverPage({super.key});
@@ -21,18 +22,55 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
   RawDatagramSocket? _socket;
 
   PdfDocument? _doc;
-  PdfPageImage? _pageImage;
+  final Map<int, PdfPageImage> _pageCache = {}; // 🚀 Кеш всех страниц
   int _currentPage = 1;
   int _pageCount = 1;
+  bool _isLoadingPages = false;
 
   final TextEditingController _ipController = TextEditingController();
   final TextEditingController _portController =
       TextEditingController(text: "8080");
 
+  // Новый HTTP сервер для приёма команд
+  final ProjectorHttpServer _httpServer = ProjectorHttpServer();
+
   @override
   void initState() {
     super.initState();
-    _startListeningForServer();
+    // Запускаем оба режима одновременно
+    _startHttpServer();  // QR режим (HTTP)
+    _startListeningForServer();  // UDP режим (старый способ)
+  }
+
+  /// 🌐 Запуск HTTP-сервера для QR режима
+  Future<void> _startHttpServer() async {
+    setState(() => _listening = true);
+
+    // Устанавливаем callback для получения PDF URL
+    _httpServer.onPdfUrlReceived = (pdfUrl) {
+      debugPrint('📥 Получен PDF URL через HTTP: $pdfUrl');
+      _downloadPdfFromUrl(pdfUrl);
+    };
+
+    // Запускаем сервер
+    final started = await _httpServer.start(port: 8081);
+
+    // Обновляем UI для отображения диагностики
+    if (mounted) {
+      setState(() {});
+    }
+
+    if (!started) {
+      debugPrint('❌ Не удалось запустить HTTP-сервер');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Ошибка запуска сервера'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
   }
 
   /// 📡 Слушаем UDP-пакеты от телефона
@@ -64,22 +102,44 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
     }
   }
 
-  /// ⬇️ Скачиваем PDF
-  Future<void> _downloadAndShowPdf(String ip, String port) async {
+  /// ⬇️ Скачиваем PDF по URL (для QR режима)
+  Future<void> _downloadPdfFromUrl(String pdfUrl) async {
     setState(() {
       _listening = false;
       _downloading = true;
     });
 
-    final url = "http://$ip:$port/pdf";
+    debugPrint('📥 Начало загрузки PDF с $pdfUrl');
 
     try {
-      final resp = await http.get(Uri.parse(url));
+      final resp = await http.get(Uri.parse(pdfUrl)).timeout(
+        const Duration(seconds: 60),
+        onTimeout: () {
+          throw Exception('Timeout: сервер не отвечает более 60 секунд');
+        },
+      );
+
+      debugPrint('✅ Ответ получен: ${resp.statusCode}');
+      debugPrint('   Content-Type: ${resp.headers['content-type']}');
+      debugPrint('   Content-Length: ${resp.headers['content-length']}');
+      debugPrint('   Размер тела: ${resp.bodyBytes.length} байт');
+
       if (resp.statusCode == 200) {
+        // Проверяем что это действительно PDF
+        final header = String.fromCharCodes(resp.bodyBytes.take(5));
+        debugPrint('   Заголовок файла: $header');
+
+        if (!header.startsWith('%PDF-')) {
+          throw Exception('Файл не является PDF! Заголовок: $header');
+        }
+
         final dir = await getApplicationSupportDirectory();
         final file = File('${dir.path}/presentation.pdf');
         await file.create(recursive: true);
         await file.writeAsBytes(resp.bodyBytes);
+        debugPrint('💾 PDF сохранён в ${file.path}');
+        debugPrint('   Размер файла: ${await file.length()} байт');
+
         setState(() {
           _pdfPath = file.path;
           _downloading = false;
@@ -88,40 +148,164 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
       } else {
         throw Exception("Ошибка загрузки (${resp.statusCode})");
       }
-    } catch (e) {
-      debugPrint("Ошибка загрузки: $e");
+    } catch (e, st) {
+      debugPrint("❌ Ошибка загрузки: $e");
+      debugPrint("Stack trace: $st");
       setState(() => _downloading = false);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка загрузки PDF: $e'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 10),
+          ),
+        );
+      }
     }
   }
 
-  /// 📄 Открываем документ
+  /// ⬇️ Скачиваем PDF (для UDP режима)
+  Future<void> _downloadAndShowPdf(String ip, String port) async {
+    setState(() {
+      _listening = false;
+      _downloading = true;
+    });
+
+    final url = "http://$ip:$port/pdf";
+    debugPrint('📥 Начало загрузки PDF с $url');
+
+    try {
+      final resp = await http.get(Uri.parse(url)).timeout(
+        const Duration(seconds: 30),
+        onTimeout: () {
+          throw Exception('Timeout: сервер не отвечает более 30 секунд');
+        },
+      );
+
+      debugPrint('✅ Ответ получен: ${resp.statusCode}');
+      debugPrint('   Content-Type: ${resp.headers['content-type']}');
+      debugPrint('   Content-Length: ${resp.headers['content-length']}');
+      debugPrint('   Размер тела: ${resp.bodyBytes.length} байт');
+
+      if (resp.statusCode == 200) {
+        // Проверяем что это действительно PDF
+        final header = String.fromCharCodes(resp.bodyBytes.take(5));
+        debugPrint('   Заголовок файла: $header');
+
+        if (!header.startsWith('%PDF-')) {
+          throw Exception('Файл не является PDF! Заголовок: $header');
+        }
+
+        final dir = await getApplicationSupportDirectory();
+        final file = File('${dir.path}/presentation.pdf');
+        await file.create(recursive: true);
+        await file.writeAsBytes(resp.bodyBytes);
+        debugPrint('💾 PDF сохранён в ${file.path}');
+        debugPrint('   Размер файла: ${await file.length()} байт');
+
+        setState(() {
+          _pdfPath = file.path;
+          _downloading = false;
+        });
+        await _openDocument(file.path);
+      } else {
+        throw Exception("Ошибка загрузки (${resp.statusCode})");
+      }
+    } catch (e, st) {
+      debugPrint("❌ Ошибка загрузки: $e");
+      debugPrint("Stack trace: $st");
+      setState(() => _downloading = false);
+
+      // Показываем детальную ошибку пользователю
+      String errorMessage = 'Ошибка загрузки: $e';
+
+      // Специальная обработка для "No route to host"
+      if (e.toString().contains('No route to host')) {
+        errorMessage = 'Не удается подключиться к $ip:$port\n\n'
+            'Проверьте:\n'
+            '• Проектор и телефон в одной сети?\n'
+            '• IP адрес телефона: $ip\n'
+            '• Попробуйте подключиться вручную';
+      }
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(errorMessage),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 10),
+            action: SnackBarAction(
+              label: 'Вручную',
+              textColor: Colors.white,
+              onPressed: _manualConnectDialog,
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  /// 📄 Открываем документ и предзагружаем все страницы
   Future<void> _openDocument(String path) async {
     try {
+      debugPrint('📄 Открытие PDF документа: $path');
+      setState(() => _isLoadingPages = true);
+
       _doc = await PdfDocument.openFile(path);
       _pageCount = _doc!.pagesCount;
-      await _renderPage(1);
-    } catch (e) {
-      debugPrint("Ошибка открытия документа: $e");
+      debugPrint('✅ PDF открыт, страниц: $_pageCount');
+
+      // 🚀 Предзагружаем ВСЕ страницы в кеш
+      for (int i = 1; i <= _pageCount; i++) {
+        debugPrint('🖼️  Рендеринг страницы $i/$_pageCount...');
+        final page = await _doc!.getPage(i);
+        final img = await page.render(
+          width: page.width * 3, // Увеличил множитель для лучшего качества
+          height: page.height * 3,
+        );
+        await page.close();
+        if (img != null) {
+          _pageCache[i] = img;
+          debugPrint('   ✅ Страница $i загружена (${img.bytes.length} байт)');
+        } else {
+          debugPrint('   ⚠️  Страница $i вернула null');
+        }
+
+        // Обновляем UI чтобы показать прогресс
+        if (i == 1) {
+          setState(() {
+            _currentPage = 1;
+            _isLoadingPages = false;
+          });
+        }
+      }
+
+      debugPrint("✅ Все $_pageCount страниц предзагружены!");
+      debugPrint("   Кеш содержит: ${_pageCache.length} страниц");
+    } catch (e, st) {
+      debugPrint("❌ Ошибка открытия документа: $e");
+      debugPrint("Stack trace: $st");
+      setState(() => _isLoadingPages = false);
+      // Показываем ошибку пользователю
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка открытия PDF: $e'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
     }
   }
 
-  /// 🖼️ Рендер одной страницы
-  Future<void> _renderPage(int pageNum) async {
-    if (_doc == null) return;
-    try {
-      final page = await _doc!.getPage(pageNum);
-      final img = await page.render(
-        width: page.width * 2,
-        height: page.height * 2,
-      );
-      await page.close();
-
+  /// 🖼️ Переключение страницы (мгновенное, из кеша)
+  void _goToPage(int pageNum) {
+    if (_pageCache.containsKey(pageNum)) {
       setState(() {
         _currentPage = pageNum;
-        _pageImage = img;
       });
-    } catch (e) {
-      debugPrint("Ошибка рендера: $e");
     }
   }
 
@@ -134,12 +318,18 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
       } catch (_) {}
     }
     await _doc?.close();
+    _pageCache.clear(); // Очищаем кеш
     setState(() {
       _pdfPath = null;
-      _pageImage = null;
       _listening = true;
+      _currentPage = 1;
+      _pageCount = 1;
     });
-    _startListeningForServer();
+
+    // Перезапускаем оба режима
+    // HTTP сервер уже запущен, просто ждём новых подключений
+    debugPrint('🔄 Возврат к экрану ожидания (QR + UDP)');
+    _startListeningForServer(); // Перезапускаем UDP listener
   }
 
   /// 🔌 Подключение вручную
@@ -191,6 +381,7 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
   void dispose() {
     _socket?.close();
     _doc?.close();
+    _httpServer.stop();
     _ipController.dispose();
     _portController.dispose();
     super.dispose();
@@ -201,53 +392,39 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
     Widget body;
 
     if (_listening) {
+      // Показываем QR-код (оба режима работают одновременно: QR + UDP)
+      body = QRWaitingPage(server: _httpServer);
+    } else if (_downloading || _isLoadingPages) {
       body = Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(Icons.wifi, size: 64, color: Colors.orange),
+            const CircularProgressIndicator(color: Colors.orangeAccent),
             const SizedBox(height: 16),
-            ElevatedButton.icon(
-              onPressed: _manualConnectDialog,
-              icon: const Icon(Icons.link),
-              label: const Text("Подключиться вручную"),
-              style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.orangeAccent),
-            ),
-            const SizedBox(height: 16),
-            const Text(
-              'Ожидание сигнала от телефона...',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 18),
+            Text(
+              _downloading
+                ? 'Загрузка презентации...'
+                : 'Предзагрузка страниц: ${_pageCache.length}/$_pageCount',
+              style: const TextStyle(fontSize: 18),
             ),
           ],
         ),
       );
-    } else if (_downloading) {
-      body = const Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            CircularProgressIndicator(color: Colors.orangeAccent),
-            SizedBox(height: 16),
-            Text('Загрузка презентации...', style: TextStyle(fontSize: 18)),
-          ],
-        ),
-      );
-    } else if (_pageImage != null) {
+    } else if (_pageCache.isNotEmpty) {
+      final currentImage = _pageCache[_currentPage];
       body = Focus(
         autofocus: true,
-        onKey: (node, event) {
-          // ✅ фильтруем дублирующиеся события
-          if (event is RawKeyDownEvent && !event.repeat) {
+        onKeyEvent: (node, event) {
+          // ✅ Обрабатываем только нажатия клавиш
+          if (event is KeyDownEvent) {
             if (event.logicalKey == LogicalKeyboardKey.arrowRight &&
                 _currentPage < _pageCount) {
-              _renderPage(_currentPage + 1);
+              _goToPage(_currentPage + 1);
               return KeyEventResult.handled;
             }
             if (event.logicalKey == LogicalKeyboardKey.arrowLeft &&
                 _currentPage > 1) {
-              _renderPage(_currentPage - 1);
+              _goToPage(_currentPage - 1);
               return KeyEventResult.handled;
             }
             if (event.logicalKey == LogicalKeyboardKey.escape ||
@@ -260,16 +437,14 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
         },
         child: Stack(
           children: [
-            AnimatedSwitcher(
-              duration: const Duration(milliseconds: 250),
-              child: Center(
-                key: ValueKey(_currentPage),
+            // 🚀 Мгновенное переключение без анимации
+            if (currentImage != null)
+              Center(
                 child: Image.memory(
-                  _pageImage!.bytes,
+                  currentImage.bytes,
                   fit: BoxFit.contain,
                 ),
               ),
-            ),
             // 🔢 Индикатор страниц
             Positioned(
               bottom: 30,
