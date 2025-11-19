@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:network_info_plus/network_info_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
 import '../services/http_server.dart';
 
 class QRWaitingPage extends StatefulWidget {
@@ -27,17 +28,35 @@ class _QRWaitingPageState extends State<QRWaitingPage> {
   /// Получить название Wi-Fi сети
   Future<void> _getWifiName() async {
     try {
-      final info = NetworkInfo();
-      final wifiName = await info.getWifiName();
-      debugPrint('🔍 Получено название Wi-Fi: $wifiName');
-      if (mounted) {
-        setState(() {
-          _wifiName = wifiName?.replaceAll('"', ''); // Убираем кавычки
-        });
-        debugPrint('✅ Wi-Fi название установлено: $_wifiName');
+      // Запрашиваем разрешение на доступ к местоположению (требуется для получения Wi-Fi на Android 10+)
+      final status = await Permission.locationWhenInUse.request();
+      debugPrint('📍 Статус разрешения на местоположение: $status');
+
+      if (status.isGranted || status.isLimited) {
+        final info = NetworkInfo();
+        final wifiName = await info.getWifiName();
+        debugPrint('🔍 Получено название Wi-Fi: $wifiName');
+        if (mounted) {
+          setState(() {
+            _wifiName = wifiName?.replaceAll('"', ''); // Убираем кавычки
+          });
+          debugPrint('✅ Wi-Fi название установлено: $_wifiName');
+        }
+      } else {
+        debugPrint('⚠️ Разрешение на местоположение не получено: $status');
+        if (mounted) {
+          setState(() {
+            _wifiName = null; // Показываем "Не подключен"
+          });
+        }
       }
     } catch (e) {
       debugPrint('❌ Ошибка получения Wi-Fi: $e');
+      if (mounted) {
+        setState(() {
+          _wifiName = null;
+        });
+      }
     }
   }
 

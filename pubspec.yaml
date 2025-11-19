@@ -17,6 +17,7 @@ dependencies:
   path_provider: ^2.1.4
   shared_preferences: ^2.2.3
   network_info_plus: ^6.0.0  # Get Wi-Fi network information
+  permission_handler: ^11.0.0  # Request runtime permissions
 
   # ✅ единственный PDF-пакет, поддерживающий новые SDK
   pdfx: ^2.6.0
