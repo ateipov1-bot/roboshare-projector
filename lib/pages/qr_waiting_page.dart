@@ -18,11 +18,25 @@ class QRWaitingPage extends StatefulWidget {
 
 class _QRWaitingPageState extends State<QRWaitingPage> {
   String? _wifiName;
+  bool _refreshing = false;
 
   @override
   void initState() {
     super.initState();
     _getWifiName();
+  }
+
+  /// Переопределить IP (при смене сети)
+  Future<void> _refreshIp() async {
+    if (_refreshing) return;
+    setState(() => _refreshing = true);
+
+    await widget.server.refreshIpAddress();
+    await _getWifiName();
+
+    if (mounted) {
+      setState(() => _refreshing = false);
+    }
   }
 
   /// Получить название Wi-Fi сети
@@ -70,9 +84,8 @@ class _QRWaitingPageState extends State<QRWaitingPage> {
         ? 'roboshare://connect?ip=$ip&port=$port'
         : 'error';
 
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Center(
+    // Возвращаем просто контент без Scaffold (Scaffold уже в родителе)
+    return Center(
         child: SingleChildScrollView(
           child: Padding(
             padding: const EdgeInsets.symmetric(vertical: 15, horizontal: 30),
@@ -90,56 +103,114 @@ class _QRWaitingPageState extends State<QRWaitingPage> {
                 ),
                 const SizedBox(height: 20),
 
-                // Название Wi-Fi сети (крупно сверху)
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 24,
-                    vertical: 12,
-                  ),
-                  decoration: BoxDecoration(
-                    color: _wifiName != null
-                        ? Colors.orange.withValues(alpha: 0.25)
-                        : Colors.red.withValues(alpha: 0.25),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: _wifiName != null
-                          ? Colors.orange.withValues(alpha: 0.5)
-                          : Colors.red.withValues(alpha: 0.5),
-                      width: 2,
-                    ),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(
-                        _wifiName != null ? Icons.wifi : Icons.wifi_off,
-                        color: _wifiName != null ? Colors.orange : Colors.red,
-                        size: 28,
+                // Название Wi-Fi сети или режим хотспота
+                Builder(
+                  builder: (context) {
+                    final ip = widget.server.ipAddress;
+                    // Проверяем различные диапазоны хотспота
+                    final isHotspot = ip != null && (
+                      ip.startsWith('192.168.43.') ||  // Android standard
+                      ip.startsWith('192.168.49.') ||  // Samsung
+                      ip.startsWith('192.168.44.') ||  // Alternative
+                      ip.startsWith('172.20.10.') ||   // iOS
+                      (ip.endsWith('.1') && (ip.startsWith('192.168.') || ip.startsWith('172.')))  // Gateway IP
+                    );
+                    // Соединение есть если IP определён
+                    final hasConnection = ip != null;
+
+                    // Определяем что показывать
+                    String connectionLabel;
+                    String connectionValue;
+                    IconData connectionIcon;
+                    Color connectionColor;
+
+                    if (isHotspot) {
+                      connectionLabel = 'Режим точки доступа';
+                      connectionValue = 'Hotspot';
+                      connectionIcon = Icons.wifi_tethering;
+                      connectionColor = Colors.blue;
+                    } else if (ip != null) {
+                      connectionLabel = 'Wi-Fi сеть';
+                      // Показываем имя сети или "Подключено" если имя не получено
+                      connectionValue = _wifiName ?? 'Подключено';
+                      connectionIcon = Icons.wifi;
+                      connectionColor = Colors.orange;
+                    } else {
+                      connectionLabel = 'Wi-Fi сеть';
+                      connectionValue = 'Не подключен';
+                      connectionIcon = Icons.wifi_off;
+                      connectionColor = Colors.red;
+                    }
+
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 24,
+                        vertical: 12,
                       ),
-                      const SizedBox(width: 12),
-                      Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+                      decoration: BoxDecoration(
+                        color: hasConnection
+                            ? connectionColor.withValues(alpha: 0.25)
+                            : Colors.red.withValues(alpha: 0.25),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: hasConnection
+                              ? connectionColor.withValues(alpha: 0.5)
+                              : Colors.red.withValues(alpha: 0.5),
+                          width: 2,
+                        ),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
                         children: [
-                          const Text(
-                            'Wi-Fi сеть',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: Colors.white60,
-                            ),
+                          Icon(
+                            connectionIcon,
+                            color: connectionColor,
+                            size: 28,
                           ),
-                          const SizedBox(height: 2),
-                          Text(
-                            _wifiName ?? 'Не подключен',
-                            style: TextStyle(
-                              fontSize: 20,
-                              color: _wifiName != null ? Colors.white : Colors.red.shade100,
-                              fontWeight: FontWeight.bold,
-                            ),
+                          const SizedBox(width: 12),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                connectionLabel,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.white60,
+                                ),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                connectionValue,
+                                style: TextStyle(
+                                  fontSize: isHotspot ? 16 : 20,
+                                  color: hasConnection ? Colors.white : Colors.red.shade100,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(width: 16),
+                          // Кнопка обновления IP
+                          IconButton(
+                            onPressed: _refreshing ? null : _refreshIp,
+                            icon: _refreshing
+                                ? const SizedBox(
+                                    width: 20,
+                                    height: 20,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white54,
+                                    ),
+                                  )
+                                : const Icon(Icons.refresh, color: Colors.white70, size: 24),
+                            tooltip: 'Обновить IP',
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(),
                           ),
                         ],
                       ),
-                    ],
-                  ),
+                    );
+                  },
                 ),
 
                 const SizedBox(height: 20),
@@ -156,7 +227,7 @@ class _QRWaitingPageState extends State<QRWaitingPage> {
                 const SizedBox(height: 15),
 
                 // QR код или ошибка
-                if (ip != null && port != null)
+                if (ip != null && port != null) ...[
                   Container(
                     padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
@@ -169,7 +240,8 @@ class _QRWaitingPageState extends State<QRWaitingPage> {
                       size: 200,
                       backgroundColor: Colors.white,
                     ),
-                  )
+                  ),
+                ]
                 else
                   Container(
                     width: 400,
@@ -233,35 +305,12 @@ class _QRWaitingPageState extends State<QRWaitingPage> {
                     ),
                   ),
 
-                const SizedBox(height: 15),
-
-                // Индикатор ожидания
-                const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    SizedBox(
-                      width: 14,
-                      height: 14,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        valueColor: AlwaysStoppedAnimation<Color>(Colors.orange),
-                      ),
-                    ),
-                    SizedBox(width: 8),
-                    Text(
-                      'Ожидание подключения...',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Colors.white54,
-                      ),
-                    ),
-                  ],
-                ),
+                // Отступ снизу для статуса Bluetooth
+                const SizedBox(height: 80),
               ],
             ),
           ),
         ),
-      ),
-    );
+      );
   }
 }

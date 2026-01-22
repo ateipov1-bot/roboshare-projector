@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:pdfx/pdfx.dart';
 import 'services/http_server.dart';
+import 'services/bluetooth_receiver_service.dart';
 import 'pages/qr_waiting_page.dart';
 
 class PresentationReceiverPage extends StatefulWidget {
@@ -18,44 +19,212 @@ class PresentationReceiverPage extends StatefulWidget {
 class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
   bool _listening = true;
   bool _downloading = false;
+  bool _isLoadingPages = false;
   String? _pdfPath;
   RawDatagramSocket? _socket;
 
+  // PDF document and page cache
   PdfDocument? _doc;
-  final Map<int, PdfPageImage> _pageCache = {}; // 🚀 Кеш всех страниц
-  int _currentPage = 1;
-  int _pageCount = 1;
-  bool _isLoadingPages = false;
+  final Map<int, PdfPageImage?> _pageCache = {};
+  int _currentPage = 0;
+  int _pageCount = 0;
+
+  // 🔍 DEBUG: Логи для диагностики
+  final List<String> _debugLogs = [];
+  bool _showDebugPanel = false;
+
+  void _log(String message) {
+    final timestamp = DateTime.now().toString().substring(11, 19);
+    final logEntry = '[$timestamp] $message';
+    debugPrint(logEntry);
+    if (mounted) {
+      setState(() {
+        _debugLogs.add(logEntry);
+        if (_debugLogs.length > 50) {
+          _debugLogs.removeAt(0);
+        }
+      });
+    }
+  }
+
+  void _hideDebugPanel() {
+    setState(() => _showDebugPanel = false);
+  }
 
   final TextEditingController _ipController = TextEditingController();
   final TextEditingController _portController =
       TextEditingController(text: "8080");
 
-  // Новый HTTP сервер для приёма команд
   final ProjectorHttpServer _httpServer = ProjectorHttpServer();
+
+  // Bluetooth receiver
+  final BluetoothReceiverService _bluetoothReceiver = BluetoothReceiverService.instance;
+  bool _bluetoothAvailable = false;
+  String? _bluetoothStatus;
+  double _bluetoothProgress = 0.0;
 
   @override
   void initState() {
     super.initState();
-    // Запускаем оба режима одновременно
-    _startHttpServer();  // QR режим (HTTP)
-    _startListeningForServer();  // UDP режим (старый способ)
+    _startHttpServer();
+    _startListeningForServer();
+    _initBluetooth();
   }
 
-  /// 🌐 Запуск HTTP-сервера для QR режима
+  Future<void> _initBluetooth() async {
+    if (!Platform.isAndroid) {
+      debugPrint('Bluetooth receiver is only available on Android');
+      return;
+    }
+
+    final available = await _bluetoothReceiver.isBluetoothAvailable();
+
+    if (!available) {
+      final enabled = await _bluetoothReceiver.requestEnableBluetooth();
+      if (!enabled) {
+        debugPrint('Bluetooth is disabled');
+        return;
+      }
+    }
+
+    setState(() {
+      _bluetoothAvailable = true;
+    });
+
+    _bluetoothReceiver.onStatusChange = (status) {
+      if (mounted) {
+        setState(() {
+          _bluetoothStatus = status;
+        });
+        _log('BT: $status');
+      }
+    };
+
+    _bluetoothReceiver.onProgress = (progress) {
+      if (mounted) {
+        setState(() {
+          _bluetoothProgress = progress;
+        });
+      }
+    };
+
+    _bluetoothReceiver.onError = (error) {
+      if (mounted) {
+        _log('BT Error: $error');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Bluetooth ошибка: $error'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    };
+
+    _bluetoothReceiver.onPdfReceived = (pdfBytes) {
+      _handleBluetoothPdfReceived(pdfBytes);
+    };
+
+    await _bluetoothReceiver.startListening();
+
+    final deviceName = await _bluetoothReceiver.getDeviceName();
+    _log('BT: Ready, device: $deviceName');
+  }
+
+  Future<void> _handleBluetoothPdfReceived(Uint8List pdfBytes) async {
+    _log('BT: PDF received, ${pdfBytes.length} bytes');
+
+    setState(() {
+      _listening = false;
+      _downloading = true;
+    });
+
+    try {
+      final dir = await getApplicationSupportDirectory();
+      final file = File('${dir.path}/presentation.pdf');
+      await file.create(recursive: true);
+      await file.writeAsBytes(pdfBytes);
+
+      _log('BT: PDF saved to ${file.path}');
+
+      setState(() {
+        _pdfPath = file.path;
+        _downloading = false;
+      });
+
+      await _openDocument(file.path);
+    } catch (e) {
+      _log('BT: Error saving PDF: $e');
+      setState(() {
+        _downloading = false;
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка сохранения PDF: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  /// Обработка PDF байтов, полученных напрямую через HTTP (офлайн режим)
+  Future<void> _handleDirectPdfBytes(Uint8List pdfBytes) async {
+    _log('HTTP Direct: PDF received, ${pdfBytes.length} bytes');
+
+    setState(() {
+      _listening = false;
+      _downloading = true;
+    });
+
+    try {
+      final dir = await getApplicationSupportDirectory();
+      final file = File('${dir.path}/presentation.pdf');
+      await file.create(recursive: true);
+      await file.writeAsBytes(pdfBytes);
+
+      _log('HTTP Direct: PDF saved to ${file.path}');
+
+      setState(() {
+        _pdfPath = file.path;
+        _downloading = false;
+      });
+
+      await _openDocument(file.path);
+    } catch (e) {
+      _log('HTTP Direct: Error saving PDF: $e');
+      setState(() {
+        _downloading = false;
+      });
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Ошибка сохранения PDF: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _startHttpServer() async {
     setState(() => _listening = true);
 
-    // Устанавливаем callback для получения PDF URL
     _httpServer.onPdfUrlReceived = (pdfUrl) {
       debugPrint('📥 Получен PDF URL через HTTP: $pdfUrl');
       _downloadPdfFromUrl(pdfUrl);
     };
 
-    // Запускаем сервер
+    // Обработчик для приёма PDF байтов напрямую (офлайн режим)
+    _httpServer.onPdfBytesReceived = (pdfBytes) {
+      debugPrint('📥 Получены PDF байты напрямую: ${pdfBytes.length} bytes');
+      _handleDirectPdfBytes(pdfBytes);
+    };
+
     final started = await _httpServer.start(port: 8081);
 
-    // Обновляем UI для отображения диагностики
     if (mounted) {
       setState(() {});
     }
@@ -73,7 +242,6 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
     }
   }
 
-  /// 📡 Слушаем UDP-пакеты от телефона
   Future<void> _startListeningForServer() async {
     try {
       _socket?.close();
@@ -102,14 +270,14 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
     }
   }
 
-  /// ⬇️ Скачиваем PDF по URL (для QR режима)
   Future<void> _downloadPdfFromUrl(String pdfUrl) async {
     setState(() {
       _listening = false;
       _downloading = true;
     });
 
-    debugPrint('📥 Начало загрузки PDF с $pdfUrl');
+    _log('📥 Начало загрузки PDF');
+    _log('URL: ${pdfUrl.length > 60 ? '${pdfUrl.substring(0, 60)}...' : pdfUrl}');
 
     try {
       final resp = await http.get(Uri.parse(pdfUrl)).timeout(
@@ -119,17 +287,15 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
         },
       );
 
-      debugPrint('✅ Ответ получен: ${resp.statusCode}');
-      debugPrint('   Content-Type: ${resp.headers['content-type']}');
-      debugPrint('   Content-Length: ${resp.headers['content-length']}');
-      debugPrint('   Размер тела: ${resp.bodyBytes.length} байт');
+      _log('✅ HTTP ${resp.statusCode}');
+      _log('Body size: ${resp.bodyBytes.length} bytes');
 
       if (resp.statusCode == 200) {
-        // Проверяем что это действительно PDF
-        final header = String.fromCharCodes(resp.bodyBytes.take(5));
-        debugPrint('   Заголовок файла: $header');
+        final header = String.fromCharCodes(resp.bodyBytes.take(10));
+        _log('File header: "$header"');
 
         if (!header.startsWith('%PDF-')) {
+          _log('❌ NOT A PDF FILE!');
           throw Exception('Файл не является PDF! Заголовок: $header');
         }
 
@@ -137,20 +303,21 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
         final file = File('${dir.path}/presentation.pdf');
         await file.create(recursive: true);
         await file.writeAsBytes(resp.bodyBytes);
-        debugPrint('💾 PDF сохранён в ${file.path}');
-        debugPrint('   Размер файла: ${await file.length()} байт');
+        _log('💾 Saved: ${await file.length()} bytes');
 
         setState(() {
           _pdfPath = file.path;
           _downloading = false;
         });
+
         await _openDocument(file.path);
       } else {
+        _log('❌ HTTP Error: ${resp.statusCode}');
         throw Exception("Ошибка загрузки (${resp.statusCode})");
       }
     } catch (e, st) {
-      debugPrint("❌ Ошибка загрузки: $e");
-      debugPrint("Stack trace: $st");
+      _log("❌ EXCEPTION: $e");
+      _log("Stack: ${st.toString().split('\n').take(3).join(' | ')}");
       setState(() => _downloading = false);
 
       if (mounted) {
@@ -165,7 +332,6 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
     }
   }
 
-  /// ⬇️ Скачиваем PDF (для UDP режима)
   Future<void> _downloadAndShowPdf(String ip, String port) async {
     setState(() {
       _listening = false;
@@ -184,14 +350,9 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
       );
 
       debugPrint('✅ Ответ получен: ${resp.statusCode}');
-      debugPrint('   Content-Type: ${resp.headers['content-type']}');
-      debugPrint('   Content-Length: ${resp.headers['content-length']}');
-      debugPrint('   Размер тела: ${resp.bodyBytes.length} байт');
 
       if (resp.statusCode == 200) {
-        // Проверяем что это действительно PDF
         final header = String.fromCharCodes(resp.bodyBytes.take(5));
-        debugPrint('   Заголовок файла: $header');
 
         if (!header.startsWith('%PDF-')) {
           throw Exception('Файл не является PDF! Заголовок: $header');
@@ -202,12 +363,12 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
         await file.create(recursive: true);
         await file.writeAsBytes(resp.bodyBytes);
         debugPrint('💾 PDF сохранён в ${file.path}');
-        debugPrint('   Размер файла: ${await file.length()} байт');
 
         setState(() {
           _pdfPath = file.path;
           _downloading = false;
         });
+
         await _openDocument(file.path);
       } else {
         throw Exception("Ошибка загрузки (${resp.statusCode})");
@@ -217,10 +378,8 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
       debugPrint("Stack trace: $st");
       setState(() => _downloading = false);
 
-      // Показываем детальную ошибку пользователю
       String errorMessage = 'Ошибка загрузки: $e';
 
-      // Специальная обработка для "No route to host"
       if (e.toString().contains('No route to host')) {
         errorMessage = 'Не удается подключиться к $ip:$port\n\n'
             'Проверьте:\n'
@@ -246,93 +405,162 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
     }
   }
 
-  /// 📄 Открываем документ и предзагружаем все страницы
   Future<void> _openDocument(String path) async {
+    _log('📖 Opening PDF: $path');
+    setState(() => _isLoadingPages = true);
+
     try {
-      debugPrint('📄 Открытие PDF документа: $path');
-      setState(() => _isLoadingPages = true);
+      final doc = await PdfDocument.openFile(path);
+      _doc = doc;
+      final count = doc.pagesCount;
+      _log('📄 PDF has $count pages');
 
-      _doc = await PdfDocument.openFile(path);
-      _pageCount = _doc!.pagesCount;
-      debugPrint('✅ PDF открыт, страниц: $_pageCount');
-
-      // 🚀 Предзагружаем ВСЕ страницы в кеш
-      for (int i = 1; i <= _pageCount; i++) {
-        debugPrint('🖼️  Рендеринг страницы $i/$_pageCount...');
-        final page = await _doc!.getPage(i);
-        final img = await page.render(
-          width: page.width * 3, // Увеличил множитель для лучшего качества
-          height: page.height * 3,
-        );
-        await page.close();
-        if (img != null) {
-          _pageCache[i] = img;
-          debugPrint('   ✅ Страница $i загружена (${img.bytes.length} байт)');
-        } else {
-          debugPrint('   ⚠️  Страница $i вернула null');
-        }
-
-        // Обновляем UI чтобы показать прогресс
-        if (i == 1) {
-          setState(() {
-            _currentPage = 1;
-            _isLoadingPages = false;
-          });
-        }
-      }
-
-      debugPrint("✅ Все $_pageCount страниц предзагружены!");
-      debugPrint("   Кеш содержит: ${_pageCache.length} страниц");
-    } catch (e, st) {
-      debugPrint("❌ Ошибка открытия документа: $e");
-      debugPrint("Stack trace: $st");
-      setState(() => _isLoadingPages = false);
-      // Показываем ошибку пользователю
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Ошибка открытия PDF: $e'),
-            backgroundColor: Colors.red,
-            duration: const Duration(seconds: 5),
-          ),
-        );
-      }
-    }
-  }
-
-  /// 🖼️ Переключение страницы (мгновенное, из кеша)
-  void _goToPage(int pageNum) {
-    if (_pageCache.containsKey(pageNum)) {
       setState(() {
-        _currentPage = pageNum;
+        _pageCount = count;
+        _currentPage = 0;
       });
+
+      // Render first page immediately
+      await _renderPage(0);
+
+      setState(() => _isLoadingPages = false);
+
+      // Render remaining pages in background
+      _renderRemainingPages();
+    } catch (e) {
+      _log('❌ Error opening PDF: $e');
+      setState(() => _isLoadingPages = false);
     }
   }
 
-  /// 🧹 Очистка
+  Future<void> _renderPage(int pageNum) async {
+    final doc = _doc;
+    if (doc == null || pageNum < 0 || pageNum >= _pageCount) return;
+    if (_pageCache.containsKey(pageNum)) return;
+
+    _log('📄 Rendering page ${pageNum + 1}/$_pageCount...');
+
+    PdfPage? page;
+    try {
+      // Check before getting page
+      if (_doc != doc) return;
+
+      page = await doc.getPage(pageNum + 1);
+
+      // Check before rendering
+      if (_doc != doc) {
+        await page.close();
+        return;
+      }
+
+      final img = await page.render(
+        width: page.width * 2,
+        height: page.height * 2,
+        format: PdfPageImageFormat.png,
+        backgroundColor: '#FFFFFF',
+      );
+
+      await page.close();
+      page = null;
+
+      // Check after rendering
+      if (_doc != doc) return;
+
+      if (mounted) {
+        setState(() {
+          _pageCache[pageNum] = img;
+        });
+      }
+    } catch (e) {
+      // Ignore "document already closed" errors - it's expected when switching documents
+      final errorStr = e.toString();
+      if (!errorStr.contains('AlreadyClosed') && !errorStr.contains('already closed')) {
+        _log('❌ Page ${pageNum + 1} ERROR: $e');
+      }
+      // Try to close page if it was opened
+      try {
+        await page?.close();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _renderRemainingPages() async {
+    final doc = _doc;
+    if (doc == null) return;
+
+    final count = _pageCount;
+    for (int i = 1; i < count; i++) {
+      // Check if document changed before each page
+      if (_doc != doc || !mounted) {
+        _log('⏹️ Stopped background rendering (document changed)');
+        break;
+      }
+      if (!_pageCache.containsKey(i)) {
+        await _renderPage(i);
+        // Small delay to avoid blocking UI
+        await Future.delayed(const Duration(milliseconds: 10));
+      }
+    }
+
+    if (_doc == doc && mounted) {
+      _log('✅ All $_pageCount pages rendered');
+    }
+  }
+
+  void _goToPage(int pageNum) {
+    if (pageNum >= 0 && pageNum < _pageCount) {
+      setState(() => _currentPage = pageNum);
+      // Ensure page is rendered
+      if (!_pageCache.containsKey(pageNum)) {
+        _renderPage(pageNum);
+      }
+    }
+  }
+
   Future<void> _cleanupAndRestart() async {
+    _log('🔄 Cleaning up and restarting...');
+
+    // First, clear _doc to signal background rendering to stop
+    final doc = _doc;
+    _doc = null;
+
+    // Clear cache immediately
+    _pageCache.clear();
+
+    // Update UI state
+    setState(() {
+      _pdfPath = null;
+      _listening = true;
+      _currentPage = 0;
+      _pageCount = 0;
+      _isLoadingPages = false;
+    });
+
+    // Wait a bit for any in-progress rendering to notice _doc is null
+    await Future.delayed(const Duration(milliseconds: 100));
+
+    // Now safely close the document
+    if (doc != null) {
+      try {
+        await doc.close();
+        _log('✅ Document closed');
+      } catch (e) {
+        _log('⚠️ Document close error (ignored): $e');
+      }
+    }
+
+    // Delete the file
     if (_pdfPath != null) {
       try {
         final file = File(_pdfPath!);
         if (await file.exists()) await file.delete();
       } catch (_) {}
     }
-    await _doc?.close();
-    _pageCache.clear(); // Очищаем кеш
-    setState(() {
-      _pdfPath = null;
-      _listening = true;
-      _currentPage = 1;
-      _pageCount = 1;
-    });
 
-    // Перезапускаем оба режима
-    // HTTP сервер уже запущен, просто ждём новых подключений
-    debugPrint('🔄 Возврат к экрану ожидания (QR + UDP)');
-    _startListeningForServer(); // Перезапускаем UDP listener
+    _log('🔄 Returning to waiting screen');
+    _startListeningForServer();
   }
 
-  /// 🔌 Подключение вручную
   Future<void> _manualConnectDialog() async {
     await showDialog(
       context: context,
@@ -380,8 +608,9 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
   @override
   void dispose() {
     _socket?.close();
-    _doc?.close();
     _httpServer.stop();
+    _bluetoothReceiver.stop();
+    _doc?.close();
     _ipController.dispose();
     _portController.dispose();
     super.dispose();
@@ -392,38 +621,93 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
     Widget body;
 
     if (_listening) {
-      // Показываем QR-код (оба режима работают одновременно: QR + UDP)
-      body = QRWaitingPage(server: _httpServer);
+      body = Stack(
+        children: [
+          QRWaitingPage(server: _httpServer),
+          if (Platform.isAndroid && _bluetoothAvailable)
+            Positioned(
+              bottom: 16,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: Colors.blue.withValues(alpha: 0.2),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: Colors.blue.withValues(alpha: 0.5)),
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Icon(Icons.bluetooth, color: Colors.blue, size: 18),
+                      const SizedBox(width: 8),
+                      Text(
+                        _bluetoothStatus ?? 'Bluetooth готов',
+                        style: const TextStyle(color: Colors.blue, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      );
     } else if (_downloading || _isLoadingPages) {
+      String statusText;
+      double? progressValue;
+
+      if (_bluetoothReceiver.isReceiving && _bluetoothStatus != null) {
+        statusText = _bluetoothStatus!;
+        progressValue = _bluetoothProgress > 0 ? _bluetoothProgress : null;
+      } else if (_isLoadingPages) {
+        statusText = 'Подготовка страниц...';
+        progressValue = _pageCache.isNotEmpty ? _pageCache.length / _pageCount : null;
+      } else {
+        statusText = 'Загрузка презентации...';
+      }
+
       body = Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const CircularProgressIndicator(color: Colors.orangeAccent),
+            CircularProgressIndicator(
+              color: Colors.orangeAccent,
+              value: progressValue,
+            ),
             const SizedBox(height: 16),
             Text(
-              _downloading
-                ? 'Загрузка презентации...'
-                : 'Предзагрузка страниц: ${_pageCache.length}/$_pageCount',
-              style: const TextStyle(fontSize: 18),
+              statusText,
+              style: const TextStyle(fontSize: 18, color: Colors.white),
             ),
+            if (progressValue != null && progressValue > 0) ...[
+              const SizedBox(height: 8),
+              Text(
+                '${(progressValue * 100).toInt()}%',
+                style: const TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.orangeAccent,
+                ),
+              ),
+            ],
           ],
         ),
       );
-    } else if (_pageCache.isNotEmpty) {
-      final currentImage = _pageCache[_currentPage];
+    } else if (_pdfPath != null && _pageCache.isNotEmpty) {
+      final currentPageImage = _pageCache[_currentPage];
+
       body = Focus(
         autofocus: true,
         onKeyEvent: (node, event) {
-          // ✅ Обрабатываем только нажатия клавиш
           if (event is KeyDownEvent) {
             if (event.logicalKey == LogicalKeyboardKey.arrowRight &&
-                _currentPage < _pageCount) {
+                _currentPage < _pageCount - 1) {
               _goToPage(_currentPage + 1);
               return KeyEventResult.handled;
             }
             if (event.logicalKey == LogicalKeyboardKey.arrowLeft &&
-                _currentPage > 1) {
+                _currentPage > 0) {
               _goToPage(_currentPage - 1);
               return KeyEventResult.handled;
             }
@@ -432,32 +716,145 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
               _cleanupAndRestart();
               return KeyEventResult.handled;
             }
+            if (event.logicalKey == LogicalKeyboardKey.keyD) {
+              setState(() => _showDebugPanel = !_showDebugPanel);
+              return KeyEventResult.handled;
+            }
           }
           return KeyEventResult.ignored;
         },
         child: Stack(
           children: [
-            // 🚀 Мгновенное переключение без анимации
-            if (currentImage != null)
-              Center(
-                child: Image.memory(
-                  currentImage.bytes,
-                  fit: BoxFit.contain,
+            // PDF Page
+            Center(
+              child: currentPageImage != null
+                  ? Image.memory(
+                      currentPageImage.bytes,
+                      fit: BoxFit.contain,
+                      gaplessPlayback: true,
+                    )
+                  : const CircularProgressIndicator(color: Colors.orangeAccent),
+            ),
+            // Debug panel
+            if (_showDebugPanel)
+              Positioned(
+                top: 0,
+                right: 0,
+                bottom: 0,
+                width: MediaQuery.of(context).size.width * 0.5,
+                child: GestureDetector(
+                  onTap: _hideDebugPanel,
+                  child: Container(
+                    color: Colors.black.withValues(alpha: 0.85),
+                    padding: const EdgeInsets.all(12),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const Text(
+                              '🔍 DEBUG LOGS',
+                              style: TextStyle(
+                                color: Colors.greenAccent,
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const Spacer(),
+                            const Text(
+                              '(tap to hide)',
+                              style: TextStyle(color: Colors.white54, fontSize: 10),
+                            ),
+                          ],
+                        ),
+                        const Divider(color: Colors.grey),
+                        Expanded(
+                          child: ListView.builder(
+                            itemCount: _debugLogs.length,
+                            itemBuilder: (ctx, i) {
+                              final log = _debugLogs[_debugLogs.length - 1 - i];
+                              Color color = Colors.white70;
+                              if (log.contains('❌')) color = Colors.redAccent;
+                              if (log.contains('✅')) color = Colors.greenAccent;
+                              if (log.contains('⚠️')) color = Colors.orangeAccent;
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 2),
+                                child: Text(
+                                  log,
+                                  style: TextStyle(
+                                    color: color,
+                                    fontSize: 11,
+                                    fontFamily: 'monospace',
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               ),
-            // 🔢 Индикатор страниц
+            // Navigation controls
             Positioned(
-              bottom: 30,
+              bottom: 20,
               left: 0,
               right: 0,
-              child: Text(
-                '$_currentPage / $_pageCount',
-                textAlign: TextAlign.center,
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  _NavigationButton(
+                    icon: Icons.chevron_left,
+                    onTap: _currentPage > 0
+                        ? () => _goToPage(_currentPage - 1)
+                        : null,
+                  ),
+                  const SizedBox(width: 8),
+                  _NavigationButton(
+                    icon: Icons.close,
+                    onTap: () => _cleanupAndRestart(),
+                  ),
+                  const SizedBox(width: 8),
+                  _NavigationButton(
+                    icon: Icons.chevron_right,
+                    onTap: _currentPage < _pageCount - 1
+                        ? () => _goToPage(_currentPage + 1)
+                        : null,
+                  ),
+                  const SizedBox(width: 16),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(20),
+                      border: Border.all(color: Colors.grey.shade400, width: 1.5),
+                    ),
+                    child: Text(
+                      '${_currentPage + 1} / $_pageCount',
+                      style: TextStyle(
+                        color: Colors.grey.shade700,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  GestureDetector(
+                    onTap: () => setState(() => _showDebugPanel = !_showDebugPanel),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: _showDebugPanel ? Colors.green : Colors.grey,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: const Text(
+                        'DEBUG',
+                        style: TextStyle(color: Colors.white, fontSize: 12),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
           ],
@@ -475,6 +872,45 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
     return Scaffold(
       backgroundColor: Colors.black,
       body: body,
+    );
+  }
+}
+
+class _NavigationButton extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback? onTap;
+
+  const _NavigationButton({
+    required this.icon,
+    this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final isDisabled = onTap == null;
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 40,
+        height: 40,
+        decoration: BoxDecoration(
+          color: isDisabled
+              ? Colors.grey.withValues(alpha: 0.3)
+              : Colors.white.withValues(alpha: 0.7),
+          shape: BoxShape.circle,
+          border: Border.all(
+            color: Colors.grey.withValues(alpha: 0.4),
+            width: 1,
+          ),
+        ),
+        child: Icon(
+          icon,
+          color: isDisabled
+              ? Colors.grey.withValues(alpha: 0.5)
+              : Colors.grey.shade600,
+          size: 24,
+        ),
+      ),
     );
   }
 }

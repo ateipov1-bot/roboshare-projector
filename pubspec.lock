@@ -25,6 +25,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.1.2"
+  bt_classic:
+    dependency: "direct main"
+    description:
+      name: bt_classic
+      sha256: "95919c8a961bb0646024eea776391b74e7895f96c724bda327fb9964e7b3ccfc"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.2"
   characters:
     dependency: transitive
     description:

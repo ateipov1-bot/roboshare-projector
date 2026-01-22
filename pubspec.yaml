@@ -25,6 +25,9 @@ dependencies:
   # QR code generation
   qr_flutter: ^4.1.0
 
+  # Bluetooth Classic with server mode support
+  bt_classic: ^1.0.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
