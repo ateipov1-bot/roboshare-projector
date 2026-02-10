@@ -1,11 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'dart:async';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:pdfx/pdfx.dart';
 import 'services/http_server.dart';
-import 'services/bluetooth_receiver_service.dart';
 import 'pages/qr_waiting_page.dart';
 
 class PresentationReceiverPage extends StatefulWidget {
@@ -22,6 +22,7 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
   bool _isLoadingPages = false;
   String? _pdfPath;
   RawDatagramSocket? _socket;
+  Timer? _beaconTimer; // Таймер для отправки beacon на телефон-хотспот
 
   // PDF document and page cache
   PdfDocument? _doc;
@@ -57,116 +58,11 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
 
   final ProjectorHttpServer _httpServer = ProjectorHttpServer();
 
-  // Bluetooth receiver
-  final BluetoothReceiverService _bluetoothReceiver = BluetoothReceiverService.instance;
-  bool _bluetoothAvailable = false;
-  String? _bluetoothStatus;
-  double _bluetoothProgress = 0.0;
-
   @override
   void initState() {
     super.initState();
     _startHttpServer();
     _startListeningForServer();
-    _initBluetooth();
-  }
-
-  Future<void> _initBluetooth() async {
-    if (!Platform.isAndroid) {
-      debugPrint('Bluetooth receiver is only available on Android');
-      return;
-    }
-
-    final available = await _bluetoothReceiver.isBluetoothAvailable();
-
-    if (!available) {
-      final enabled = await _bluetoothReceiver.requestEnableBluetooth();
-      if (!enabled) {
-        debugPrint('Bluetooth is disabled');
-        return;
-      }
-    }
-
-    setState(() {
-      _bluetoothAvailable = true;
-    });
-
-    _bluetoothReceiver.onStatusChange = (status) {
-      if (mounted) {
-        setState(() {
-          _bluetoothStatus = status;
-        });
-        _log('BT: $status');
-      }
-    };
-
-    _bluetoothReceiver.onProgress = (progress) {
-      if (mounted) {
-        setState(() {
-          _bluetoothProgress = progress;
-        });
-      }
-    };
-
-    _bluetoothReceiver.onError = (error) {
-      if (mounted) {
-        _log('BT Error: $error');
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Bluetooth ошибка: $error'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    };
-
-    _bluetoothReceiver.onPdfReceived = (pdfBytes) {
-      _handleBluetoothPdfReceived(pdfBytes);
-    };
-
-    await _bluetoothReceiver.startListening();
-
-    final deviceName = await _bluetoothReceiver.getDeviceName();
-    _log('BT: Ready, device: $deviceName');
-  }
-
-  Future<void> _handleBluetoothPdfReceived(Uint8List pdfBytes) async {
-    _log('BT: PDF received, ${pdfBytes.length} bytes');
-
-    setState(() {
-      _listening = false;
-      _downloading = true;
-    });
-
-    try {
-      final dir = await getApplicationSupportDirectory();
-      final file = File('${dir.path}/presentation.pdf');
-      await file.create(recursive: true);
-      await file.writeAsBytes(pdfBytes);
-
-      _log('BT: PDF saved to ${file.path}');
-
-      setState(() {
-        _pdfPath = file.path;
-        _downloading = false;
-      });
-
-      await _openDocument(file.path);
-    } catch (e) {
-      _log('BT: Error saving PDF: $e');
-      setState(() {
-        _downloading = false;
-      });
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Ошибка сохранения PDF: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
-    }
   }
 
   /// Обработка PDF байтов, полученных напрямую через HTTP (офлайн режим)
@@ -246,28 +142,87 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
     try {
       _socket?.close();
       _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 54545);
+      debugPrint('📡 UDP слушатель запущен на порту 54545');
       setState(() => _listening = true);
 
       _socket!.listen((e) async {
         if (e == RawSocketEvent.read) {
           final datagram = _socket!.receive();
           if (datagram != null) {
+            final senderIp = datagram.address.address;
+            final senderPort = datagram.port;
             final msg = String.fromCharCodes(datagram.data);
+            debugPrint('📥 UDP пакет от $senderIp:$senderPort');
+            debugPrint('   Содержимое: $msg');
+
             if (msg.startsWith("RoboShareServer:")) {
               final parts = msg.split(":");
               if (parts.length >= 3) {
                 final ip = parts[1];
                 final port = parts[2];
+                debugPrint('✅ Распознан сервер: $ip:$port');
                 _socket!.close();
                 await _downloadAndShowPdf(ip, port);
+              } else {
+                debugPrint('❌ Неверный формат сообщения: недостаточно частей');
               }
+            } else {
+              debugPrint('⚠️ Неизвестный формат сообщения');
             }
           }
         }
       });
     } catch (e) {
-      debugPrint("UDP error: $e");
+      debugPrint("❌ UDP error: $e");
     }
+
+    // Запускаем отправку beacon для случая когда телефон - хотспот
+    _startBeaconBroadcast();
+  }
+
+  /// Отправляем UDP beacon на gateway (телефон-хотспот) каждые 2 секунды
+  /// Это нужно потому что Android блокирует UDP broadcast ОТ хотспота к клиентам,
+  /// но разрешает UDP от клиентов К хотспоту
+  void _startBeaconBroadcast() {
+    _beaconTimer?.cancel();
+
+    _beaconTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
+      if (!_listening) {
+        timer.cancel();
+        return;
+      }
+
+      try {
+        final ip = _httpServer.ipAddress;
+        final port = _httpServer.port;
+
+        if (ip == null || port == null) return;
+
+        // Определяем gateway (телефон-хотспот) - обычно .1 в подсети
+        final parts = ip.split('.');
+        if (parts.length != 4) return;
+
+        final gatewayIp = '${parts[0]}.${parts[1]}.${parts[2]}.1';
+
+        // Если мы сами gateway (.1), не отправляем beacon
+        if (ip == gatewayIp) return;
+
+        // Отправляем beacon на gateway
+        final socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+        final message = 'RoboShareProjector:$ip:$port';
+
+        socket.send(
+          message.codeUnits,
+          InternetAddress(gatewayIp),
+          54546, // Другой порт для beacon от проектора
+        );
+
+        socket.close();
+        debugPrint('📡 Beacon отправлен на $gatewayIp:54546 ($message)');
+      } catch (e) {
+        // Игнорируем ошибки beacon
+      }
+    });
   }
 
   Future<void> _downloadPdfFromUrl(String pdfUrl) async {
@@ -607,9 +562,9 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
 
   @override
   void dispose() {
+    _beaconTimer?.cancel();
     _socket?.close();
     _httpServer.stop();
-    _bluetoothReceiver.stop();
     _doc?.close();
     _ipController.dispose();
     _portController.dispose();
@@ -621,46 +576,12 @@ class _PresentationReceiverPageState extends State<PresentationReceiverPage> {
     Widget body;
 
     if (_listening) {
-      body = Stack(
-        children: [
-          QRWaitingPage(server: _httpServer),
-          if (Platform.isAndroid && _bluetoothAvailable)
-            Positioned(
-              bottom: 16,
-              left: 0,
-              right: 0,
-              child: Center(
-                child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                  decoration: BoxDecoration(
-                    color: Colors.blue.withValues(alpha: 0.2),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: Colors.blue.withValues(alpha: 0.5)),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.bluetooth, color: Colors.blue, size: 18),
-                      const SizedBox(width: 8),
-                      Text(
-                        _bluetoothStatus ?? 'Bluetooth готов',
-                        style: const TextStyle(color: Colors.blue, fontSize: 12),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-        ],
-      );
+      body = QRWaitingPage(server: _httpServer);
     } else if (_downloading || _isLoadingPages) {
       String statusText;
       double? progressValue;
 
-      if (_bluetoothReceiver.isReceiving && _bluetoothStatus != null) {
-        statusText = _bluetoothStatus!;
-        progressValue = _bluetoothProgress > 0 ? _bluetoothProgress : null;
-      } else if (_isLoadingPages) {
+      if (_isLoadingPages) {
         statusText = 'Подготовка страниц...';
         progressValue = _pageCache.isNotEmpty ? _pageCache.length / _pageCount : null;
       } else {

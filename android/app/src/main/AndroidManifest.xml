@@ -1,5 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.example.roboshare_projector">
+    package="com.robospark.projector">
 
     <!-- ✅ Разрешения для работы сети -->
     <uses-permission android:name="android.permission.INTERNET" />

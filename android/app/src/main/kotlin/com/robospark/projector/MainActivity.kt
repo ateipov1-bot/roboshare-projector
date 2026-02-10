@@ -1,4 +1,4 @@
-package com.example.roboshare_projector
+package com.robospark.projector
 
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
