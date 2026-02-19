@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import '../services/http_server.dart';
 
 class QRWaitingPage extends StatefulWidget {
@@ -19,11 +20,29 @@ class QRWaitingPage extends StatefulWidget {
 class _QRWaitingPageState extends State<QRWaitingPage> {
   String? _wifiName;
   bool _refreshing = false;
+  String _version = '';
+  String _buildNumber = '';
 
   @override
   void initState() {
     super.initState();
     _getWifiName();
+    _loadAppVersion();
+  }
+
+  /// Загрузить версию приложения
+  Future<void> _loadAppVersion() async {
+    try {
+      final packageInfo = await PackageInfo.fromPlatform();
+      if (mounted) {
+        setState(() {
+          _version = packageInfo.version;
+          _buildNumber = packageInfo.buildNumber;
+        });
+      }
+    } catch (e) {
+      debugPrint('❌ Ошибка получения версии приложения: $e');
+    }
   }
 
   /// Переопределить IP (при смене сети)
@@ -305,8 +324,34 @@ class _QRWaitingPageState extends State<QRWaitingPage> {
                     ),
                   ),
 
+                // Версия приложения
+                const SizedBox(height: 30),
+                if (_version.isNotEmpty)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(
+                        color: Colors.white.withValues(alpha: 0.2),
+                        width: 1,
+                      ),
+                    ),
+                    child: Text(
+                      'Версия: $_version (Build $_buildNumber)',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.white70,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+
                 // Отступ снизу для статуса Bluetooth
-                const SizedBox(height: 80),
+                const SizedBox(height: 30),
               ],
             ),
           ),

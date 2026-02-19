@@ -25,6 +25,9 @@ dependencies:
   # QR code generation
   qr_flutter: ^4.1.0
 
+  # App version info
+  package_info_plus: ^8.0.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
